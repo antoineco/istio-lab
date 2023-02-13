@@ -1,0 +1,199 @@
+# Lima VM definition for Docker inside Fedora Linux with extra tools.
+
+images:
+- location: https://download.fedoraproject.org/pub/fedora/linux/releases/37/Cloud/x86_64/images/Fedora-Cloud-Base-37-1.7.x86_64.qcow2
+  arch: x86_64
+  digest: sha256:b5b9bec91eee65489a5745f6ee620573b23337cbb1eb4501ce200b157a01f3a0
+- location: https://download.fedoraproject.org/pub/fedora/linux/releases/37/Cloud/aarch64/images/Fedora-Cloud-Base-37-1.7.aarch64.qcow2
+  arch: aarch64
+  digest: sha256:cc8b0f49bc60875a16eef65ad13e0e86ba502ba3585cc51146f11f4182a628c0
+
+mounts:
+- location: '~'
+- location: /tmp/lima
+  writable: true
+
+# managed by Docker, not Lima
+containerd:
+  system: false
+  user: false
+
+hostResolver:
+  hosts:
+    host.docker.internal: host.lima.internal
+
+portForwards:
+- guestSocket: /var/run/docker.sock
+  hostSocket: '{{.Dir}}/sock/docker.sock'
+
+provision:
+
+# PATH mangling for login shells.
+# Do this early to ensure that probes use a fully populated PATH on their first attempt already.
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if [ -e /etc/profile.d/go.sh ]; then
+    	exit 0
+    fi
+    cat <<-'EOF' >/etc/profile.d/go.sh
+    	PATH="/usr/local/go/bin:${PATH}"
+    	if command -v go >/dev/null; then
+    		PATH="$(go env GOPATH)/bin:${PATH}"
+    	fi
+    	export PATH
+    EOF
+
+# Install Docker.
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if command -v docker >/dev/null; then
+    	exit 0
+    fi
+    if [ ! -e /etc/systemd/system/docker.socket.d/override.conf ]; then
+    	mkdir -p /etc/systemd/system/docker.socket.d
+    	cat <<-EOF >/etc/systemd/system/docker.socket.d/override.conf
+    		[Socket]
+    		SocketUser=${LIMA_CIDATA_USER}
+    	EOF
+    fi
+    # While using Docker to run KinD clusters, we have to account for `kube-apiserver`, `kube-controller-manager` and
+    # `kubelet` processes using a high number of inotify resources.
+    # https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files
+    if [ ! -e /etc/sysctl.d/inotify.conf ]; then
+    	cat <<-EOF >/etc/sysctl.d/inotify.conf
+    		fs.inotify.max_user_watches = 524288
+    		fs.inotify.max_user_instances = 512
+    	EOF
+    	sysctl -p /etc/sysctl.d/inotify.conf
+    fi
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker.service
+
+# Install Go.
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    go_ver=1.20
+    PATH="/usr/local/go/bin:${PATH}"
+    if command -v go >/dev/null && [[ $(go env GOVERSION) == "go${go_ver}" ]]; then
+    	exit 0
+    fi
+    declare arch
+    arch="$(arch)"
+    declare goarch
+    case "$arch" in
+    	aarch64)
+    		goarch=arm64
+    		;;
+    	*)
+    		goarch=amd64
+    		;;
+    esac
+    declare tmpdir
+    tmpdir="$(mktemp -d)"
+    pushd "${tmpdir}" >/dev/null || exit
+    curl -sLo go.tgz "https://go.dev/dl/go${go_ver}.linux-${goarch}.tar.gz"
+    tar -xzf go.tgz
+    chown -R root:root go
+    rm -rf "/usr/local/go${go_ver}"
+    mv go "/usr/local/go${go_ver}"
+    ln -nsf "go${go_ver}" /usr/local/go
+    popd >/dev/null || exit
+    rm -rf "${tmpdir}"
+
+# Install kubectl.
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    kubectl_ver=1.25.3
+    if command -v kubectl >/dev/null && \
+    	[[ $(kubectl version --client -o json | jq -r '.clientVersion.gitVersion') == "v${kubectl_ver}" ]]; then
+    	exit 0
+    fi
+    declare tmpdir
+    tmpdir="$(mktemp -d)"
+    pushd "${tmpdir}" >/dev/null || exit
+    declare arch
+    arch="$(arch)"
+    declare karch
+    case "$arch" in
+    	aarch64)
+    		karch=arm64
+    		;;
+    	*)
+    		karch=amd64
+    		;;
+    esac
+    curl -sLo kubectl "https://dl.k8s.io/release/v${kubectl_ver}/bin/linux/${karch}/kubectl"
+    chmod +x kubectl
+    rm -rf "/usr/local/bin/kubectl${kubectl_ver}"
+    mv kubectl "/usr/local/bin/kubectl${kubectl_ver}"
+    ln -nsf "kubectl${kubectl_ver}" /usr/local/bin/kubectl
+    popd >/dev/null || exit
+    rm -rf "${tmpdir}"
+
+# Install ko for the local user.
+- mode: user
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    ko_ver=0.12.0
+    if command -v ko >/dev/null && [[ $(ko version) == "v${ko_ver}" ]]; then
+    	exit 0
+    fi
+    go install "github.com/google/ko@v${ko_ver}"
+
+probes:
+
+- description: Docker is installed and running
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if ! timeout 30s bash -c 'until command -v docker >/dev/null; do sleep 1; done'; then
+      echo >&2 'Docker was not installed'
+      exit 1
+    fi
+    if ! timeout 30s bash -c 'until pgrep dockerd; do sleep 1; done'; then
+      echo >&2 'dockerd is not running'
+      exit 1
+    fi
+
+- description: Go is installed
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if ! timeout 30s bash -c 'until command -v go >/dev/null; do sleep 1; done'; then
+      echo >&2 'Go was not installed'
+      exit 1
+    fi
+
+- description: kubectl is installed
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if ! timeout 30s bash -c 'until command -v kubectl >/dev/null; do sleep 1; done'; then
+      echo >&2 'kubectl was not installed'
+      exit 1
+    fi
+
+- description: ko is installed
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if ! timeout 180s bash -c 'until command -v ko >/dev/null; do sleep 1; done'; then
+      echo >&2 'ko was not installed'
+      exit 1
+    fi
+
+message: |
+  To run `docker` on the host, run the following commands:
+  ------
+  docker context create lima-{{.Name}} --docker "host=unix://{{.Dir}}/sock/docker.sock"
+  docker context use lima-{{.Name}}
+  ------
